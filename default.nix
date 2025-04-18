@@ -6,7 +6,7 @@ pkgs.buildGoModule rec {
 
   src = ./.; # Point directly to your source directory
 
-  vendorHash = null; 
+  vendorHash = null;
 
   proxyVendor = true;
 

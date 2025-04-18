@@ -1,14 +1,14 @@
- package main
+package main
 
 import (
 	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -176,84 +176,69 @@ func getCardStatus(cardInfo map[string]interface{}) CardStatus {
 
 func appendToTOML(filename string, cardMap map[string]CardStatus) error {
 	dir := filepath.Dir(filename)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("failed to create directory '%s': %w", dir, err)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("failed to create directory %q: %w", dir, err)
 	}
 
-	var contentBytes []byte
-	contentBytes, err := ioutil.ReadFile(filename)
-	if err != nil {
-		if os.IsNotExist(err) {
-			log.Printf("File '%s' not found, will create a new one.", filename)
-			contentBytes = []byte{}
-		} else {
-			return fmt.Errorf("failed to read file '%s': %w", filename, err)
-		}
+	existing, err := os.ReadFile(filename)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to read %q: %w", filename, err)
 	}
-	content := string(contentBytes)
 
 	today := time.Now().Format("2006-01-02")
 	dateHeader := fmt.Sprintf("[%s]", today)
 
-	var newContent strings.Builder
+	var section strings.Builder
+	section.WriteString(dateHeader + "\n")
+	for word, status := range cardMap {
+		escaped := strings.ReplaceAll(word, `"`, `\"`)
+		section.WriteString(fmt.Sprintf("\"%s\" = \"%s\"\n", escaped, status))
+	}
+	newBlock := []byte(section.String())
 
-	if strings.Contains(content, dateHeader) {
-		lines := strings.Split(content, "\n")
-		inTodaySection := false
-		addedNewCards := false
-
-		for i, line := range lines {
-			trimmedLine := strings.TrimSpace(line)
-			isLastLine := i == len(lines)-1
-
-			if trimmedLine == dateHeader {
-				inTodaySection = true
-				newContent.WriteString(line + "\n")
-
-				for word, status := range cardMap {
-					escapedWord := strings.ReplaceAll(word, "\"", "\\\"")
-					newContent.WriteString(fmt.Sprintf("\"%s\" = \"%s\"\n", escapedWord, status))
-				}
-				addedNewCards = true
-
-			} else if inTodaySection && (strings.HasPrefix(trimmedLine, "[") && strings.HasSuffix(trimmedLine, "]")) {
-				inTodaySection = false
-				newContent.WriteString(line)
-				if !isLastLine {
-					newContent.WriteString("\n")
-				}
-			} else if !inTodaySection {
-				newContent.WriteString(line)
-				if !isLastLine {
-					newContent.WriteString("\n")
-				}
-			}
+	start := bytes.Index(existing, []byte(dateHeader))
+	if start != -1 {
+		searchFrom := start + len(dateHeader)
+		next := bytes.Index(existing[searchFrom:], []byte("\n["))
+		var end int
+		if next == -1 {
+			end = len(existing)
+		} else {
+			end = searchFrom + next + 1
 		}
-
-		if !addedNewCards && inTodaySection {
-			for word, status := range cardMap {
-				escapedWord := strings.ReplaceAll(word, "\"", "\\\"")
-				newContent.WriteString(fmt.Sprintf("\"%s\" = \"%s\"\n", escapedWord, status))
-			}
-		}
-		content = newContent.String()
-
-	} else {
-		var newSection strings.Builder
-		if len(strings.TrimSpace(content)) > 0 {
-			newSection.WriteString("\n")
-		}
-		newSection.WriteString(dateHeader + "\n")
-
-		for word, status := range cardMap {
-			escapedWord := strings.ReplaceAll(word, "\"", "\\\"")
-			newSection.WriteString(fmt.Sprintf("\"%s\" = \"%s\"\n", escapedWord, status))
-		}
-
-		content += newSection.String()
+		existing = append(existing[:start], existing[end:]...)
+		existing = bytes.TrimRight(existing, "\n")
 	}
 
-	return ioutil.WriteFile(filename, []byte(strings.TrimRight(content, "\n")+"\n"), 0644)
+	if len(existing) > 0 && existing[len(existing)-1] != '\n' {
+		existing = append(existing, '\n')
+	}
+	existing = append(existing, newBlock...)
+
+	data := append(bytes.TrimRight(existing, "\n"), '\n')
+	if err := os.WriteFile(filename, data, 0o644); err != nil {
+		return fmt.Errorf("failed to write %q: %w", filename, err)
+	}
+	return nil
+}
+
+func gitAddCommit(filePath string, numReviews int, numNewWords int) error {
+	_, err := exec.Command("git", "add", filePath).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to add file to Git: %w", err)
+	}
+
+	now := time.Now()
+	dateStr := now.Format("2006-01-02")
+	commitMessage := fmt.Sprintf("Anki stats for %s: %d reviews, %d new words", dateStr, numReviews, numNewWords)
+
+	_, err = exec.Command("git", "commit", "-m", commitMessage).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to commit changes to Git: %w", err)
+	}
+
+	fmt.Printf("Successfully added and committed changes to Git with message: \"%s\"\n", commitMessage)
+	return nil
 }
 
 func main() {
@@ -269,13 +254,13 @@ func main() {
 	versionStr := "unknown"
 	if versionMap, ok := versionResult.(map[string]interface{}); ok {
 		if v, ok := versionMap["version"].(string); ok {
-		    versionStr = v
-        }
+			versionStr = v
+		}
 	} else if v, ok := versionResult.(float64); ok {
-        versionStr = fmt.Sprintf("%.0f", v)
-    } else if v, ok := versionResult.(string); ok {
-        versionStr = v
-    }
+		versionStr = fmt.Sprintf("%.0f", v)
+	} else if v, ok := versionResult.(string); ok {
+		versionStr = v
+	}
 
 	fmt.Printf("Connected to AnkiConnect v%s\n", versionStr)
 
@@ -299,6 +284,7 @@ func main() {
 
 	processedCount := 0
 	skippedCount := 0
+	newWordCount := 0
 	for _, cardID := range reviewedCardIDs {
 		card, err := getCardInfo(cardID)
 		if err != nil {
@@ -308,7 +294,11 @@ func main() {
 		}
 
 		if card.Word != "" {
+			_, alreadySeen := uniqueCards[card.Word]
 			uniqueCards[card.Word] = card.Status
+			if !alreadySeen && card.Status == StatusNew {
+				newWordCount++
+			}
 			processedCount++
 		} else {
 			log.Printf("Warning: Card ID %v resulted in an empty Word field after processing. Skipping.", cardID)
@@ -323,7 +313,7 @@ func main() {
 			log.Fatalf("Failed to write to TOML file '%s': %v", outputFilePath, err)
 		}
 
-		fmt.Printf("\nSuccessfully logged %d unique cards to %s\n", len(uniqueCards), outputFilePath)
+		fmt.Printf("\nSuccessfully logged %d unique cards (%d new) to %s\n", len(uniqueCards), newWordCount, outputFilePath)
 
 		fmt.Println("\nSample of logged cards:")
 		i := 0
@@ -335,6 +325,10 @@ func main() {
 			printableWord := strings.ReplaceAll(word, "\n", " ")
 			fmt.Printf("- \"%s\" = \"%s\"\n", printableWord, status)
 			i++
+		}
+
+		if err := gitAddCommit(outputFilePath, len(uniqueCards), newWordCount); err != nil {
+			log.Printf("Warning: Failed to add and commit changes to Git: %v", err)
 		}
 	} else {
 		fmt.Println("No unique cards with non-empty words found to log today.")
